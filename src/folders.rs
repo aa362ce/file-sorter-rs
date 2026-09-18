@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dedupe::DuplicateGroup;
@@ -11,7 +12,7 @@ use crate::progress::Progress;
 /// an exact match. `confirmed` is false if any of the underlying file
 /// matches was itself unconfirmed (see `DuplicateGroup::confirmed`) -- the
 /// same "verify before deleting" caution applies to the folder as a whole.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderGroup {
     pub paths: Vec<PathBuf>,
     pub file_count: usize,

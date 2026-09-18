@@ -85,6 +85,22 @@ pub struct RunRecord {
     pub duration_seconds: f64,
 }
 
+/// A run's summary plus its full duplicate-group detail, for transferring
+/// history between machines. Flattening `RunRecord` keeps this format a
+/// superset of the summary-only one `export_history` used to write, so an
+/// old export (or one with no saved detail) still imports fine -- the detail
+/// fields just come back empty. They're named distinctly from `RunRecord`'s
+/// own `groups` (a count) so flattening the two doesn't collide.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunExport {
+    #[serde(flatten)]
+    pub record: RunRecord,
+    #[serde(default)]
+    pub duplicate_groups: Vec<DuplicateGroup>,
+    #[serde(default)]
+    pub duplicate_folder_groups: Vec<FolderGroup>,
+}
+
 fn connect() -> Result<Connection> {
     std::fs::create_dir_all(store_dir())?;
     let conn = Connection::open(db_path())?;
@@ -470,6 +486,10 @@ pub fn record_run(directories: &[PathBuf], result: &ScanResult, duration_seconds
 }
 
 pub fn save_run_groups(run_id: &str, result: &ScanResult) -> Result<()> {
+    save_run_group_data(run_id, &result.groups, &result.folder_groups)
+}
+
+pub fn save_run_group_data(run_id: &str, groups: &[DuplicateGroup], folder_groups: &[FolderGroup]) -> Result<()> {
     let mut conn = connect()?;
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM run_groups WHERE run_id = ?1", params![run_id])?;
@@ -481,13 +501,13 @@ pub fn save_run_groups(run_id: &str, result: &ScanResult) -> Result<()> {
         let mut path_stmt = tx.prepare(
             "INSERT INTO run_group_paths (run_id, group_idx, kind, seq, path) VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        for (idx, group) in result.groups.iter().enumerate() {
+        for (idx, group) in groups.iter().enumerate() {
             group_stmt.execute(params![run_id, idx as i64, "file", group.file_hash, None::<i64>, group.size as i64, group.confirmed as i64])?;
             for (seq, path) in group.paths.iter().enumerate() {
                 path_stmt.execute(params![run_id, idx as i64, "file", seq as i64, path.to_string_lossy().to_string()])?;
             }
         }
-        for (idx, fg) in result.folder_groups.iter().enumerate() {
+        for (idx, fg) in folder_groups.iter().enumerate() {
             group_stmt.execute(params![run_id, idx as i64, "folder", None::<String>, fg.file_count as i64, fg.size as i64, fg.confirmed as i64])?;
             for (seq, path) in fg.paths.iter().enumerate() {
                 path_stmt.execute(params![run_id, idx as i64, "folder", seq as i64, path.to_string_lossy().to_string()])?;
@@ -571,15 +591,27 @@ pub fn load_history() -> Result<Vec<RunRecord>> {
     Ok(rows)
 }
 
+/// Exports full run history, including each run's saved duplicate-group
+/// detail (when kept -- see `MAX_HISTORY_ENTRIES`/`load_run_groups`), so the
+/// result can be imported on another machine and `--show` still works there.
 pub fn export_history(path: &Path) -> Result<usize> {
     let records = load_history()?;
-    std::fs::write(path, serde_json::to_string_pretty(&records)?)?;
-    Ok(records.len())
+    let mut exports = Vec::with_capacity(records.len());
+    for record in records {
+        let run_id = format!("{}", record.timestamp);
+        let (duplicate_groups, duplicate_folder_groups) = load_run_groups(&run_id)?.unwrap_or_default();
+        exports.push(RunExport { record, duplicate_groups, duplicate_folder_groups });
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&exports)?)?;
+    Ok(exports.len())
 }
 
+/// Imports run history previously written by `export_history`. Also accepts
+/// an older summary-only export (a bare `Vec<RunRecord>`), since
+/// `RunExport`'s flattened fields are a superset of `RunRecord`'s.
 pub fn import_history(path: &Path) -> Result<usize> {
     let raw = std::fs::read_to_string(path)?;
-    let incoming: Vec<RunRecord> = serde_json::from_str(&raw)?;
+    let incoming: Vec<RunExport> = serde_json::from_str(&raw)?;
 
     let existing = load_history()?;
     let mut seen: HashSet<(String, String)> = existing
@@ -589,13 +621,18 @@ pub fn import_history(path: &Path) -> Result<usize> {
 
     let mut added = 0usize;
     let conn = connect()?;
-    for record in incoming {
+    for export in incoming {
+        let record = &export.record;
         let key = (format!("{}", record.timestamp), record.directories.join("\u{0}"));
         if seen.contains(&key) {
             continue;
         }
         seen.insert(key);
-        upsert_run(&conn, &record.timestamp.to_string(), &record)?;
+        let run_id = record.timestamp.to_string();
+        upsert_run(&conn, &run_id, record)?;
+        if !export.duplicate_groups.is_empty() || !export.duplicate_folder_groups.is_empty() {
+            save_run_group_data(&run_id, &export.duplicate_groups, &export.duplicate_folder_groups)?;
+        }
         added += 1;
     }
     Ok(added)

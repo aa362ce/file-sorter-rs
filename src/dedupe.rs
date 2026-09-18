@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::folders::{find_duplicate_folders, FolderGroup};
@@ -339,7 +340,7 @@ fn walk_checkpointed(
 /// known to share a size and partial hash -- full confirmation was deferred
 /// rather than paying its cost during the scan. `file_hash` for such a group
 /// is a "size:partial_hash" string, not a SHA-256 digest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateGroup {
     pub file_hash: String,
     pub size: u64,
