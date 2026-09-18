@@ -1,0 +1,28 @@
+[package]
+name = "file-sorter"
+version = "0.1.0"
+edition = "2021"
+description = "Find duplicate files across one or more directories"
+license = "MIT"
+
+[[bin]]
+name = "file-sorter"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
+rayon = "1.10"
+trash = "5"
+ctrlc = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+num_cpus = "1"
+is-terminal = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
