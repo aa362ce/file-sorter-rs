@@ -304,7 +304,7 @@ fn plan_duplicates_to_remove<'a>(
 /// so duplicates that happen to share a relative path under different
 /// scanned directories -- or different drives entirely -- never collide at
 /// the destination.
-fn mirrored_path(path: &Path, dest_root: &Path) -> PathBuf {
+pub(crate) fn mirrored_path(path: &Path, dest_root: &Path) -> PathBuf {
     let mut result = dest_root.to_path_buf();
     for component in path.components() {
         match component {
@@ -319,7 +319,7 @@ fn mirrored_path(path: &Path, dest_root: &Path) -> PathBuf {
     result
 }
 
-fn move_path(src: &Path, dest: &Path) -> io::Result<()> {
+pub(crate) fn move_path(src: &Path, dest: &Path) -> io::Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }

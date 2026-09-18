@@ -1,12 +1,5 @@
-mod cli;
-mod dedupe;
-mod folders;
-mod formatting;
-mod progress;
-mod store;
-
 fn main() {
-    match cli::run() {
+    match file_sorter::cli::run() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("error: {:#}", err);

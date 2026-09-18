@@ -5,9 +5,17 @@ edition = "2021"
 description = "Find duplicate files across one or more directories"
 license = "MIT"
 
+[lib]
+name = "file_sorter"
+path = "src/lib.rs"
+
 [[bin]]
 name = "file-sorter"
 path = "src/main.rs"
+
+[[bin]]
+name = "file-sorter-gui"
+path = "src/bin/gui.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -22,6 +30,8 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 num_cpus = "1"
 is-terminal = "0.4"
+iced = { version = "0.14", features = ["tokio", "advanced"] }
+rfd = "0.15"
 
 [profile.release]
 opt-level = 3
