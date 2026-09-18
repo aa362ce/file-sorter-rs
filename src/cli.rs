@@ -57,11 +57,21 @@ struct Cli {
     #[arg(long)]
     delete: bool,
 
-    /// Skip the confirmation prompt before deleting (only meaningful with --delete)
+    /// Move duplicates into DIR instead of deleting them -- keeps the first copy in each group
+    /// in place (same convention as --delete) and moves the rest, mirroring each moved
+    /// file's/folder's original absolute path underneath DIR (e.g. a file from
+    /// /home/user/a.jpg lands at DIR/home/user/a.jpg) so duplicates from different source
+    /// folders never collide by name and stay easy to trace back. DIR is created if it doesn't
+    /// exist. Mutually exclusive with --delete.
+    #[arg(long, value_name = "DIR")]
+    move_to: Option<String>,
+
+    /// Skip the confirmation prompt before deleting/moving (only meaningful with
+    /// --delete/--move-to)
     #[arg(short = 'y', long)]
     yes: bool,
 
-    /// Preview what --delete would do without deleting anything
+    /// Preview what --delete/--move-to would do without touching anything
     #[arg(long)]
     dry_run: bool,
 
@@ -251,26 +261,97 @@ fn under_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|r| path.starts_with(r))
 }
 
-fn delete_duplicates(groups: &[DuplicateGroup], folder_groups: &[FolderGroup], skip_confirmation: bool, dry_run: bool) -> anyhow::Result<()> {
-    // Only a *confirmed* folder group can be deleted as a single unit.
-    let folders_to_delete: Vec<(&FolderGroup, &PathBuf)> =
-        folder_groups.iter().filter(|fg| fg.confirmed).flat_map(|fg| fg.paths[1..].iter().map(move |p| (fg, p))).collect();
-    let delete_dirs: Vec<PathBuf> = folders_to_delete.iter().map(|(_, p)| (*p).clone()).collect();
+type FoldersToRemove<'a> = Vec<(&'a FolderGroup, &'a PathBuf)>;
+type FilesToRemove<'a> = Vec<(&'a DuplicateGroup, &'a PathBuf)>;
 
-    // Re-derive keep/delete among paths not already covered by a folder-level
-    // deletion, rather than blindly trusting group.paths[0]/[1:] -- otherwise
-    // a file whose "kept" copy sits in a folder being bulk-deleted could end
-    // up with every copy removed.
-    let mut files_to_delete: Vec<(&DuplicateGroup, &PathBuf)> = Vec::new();
+/// Picks which folder/file copies `--delete` and `--move-to` both act on.
+///
+/// Only a *confirmed* folder group can be handled as a single unit -- every
+/// file inside one was already individually confirmed, so acting on the
+/// whole directory needs no further verification. An unconfirmed
+/// (deferred, large-file) folder group is left alone here entirely; its
+/// files fall through to the per-file plan below, which already verifies
+/// each one before it's touched.
+fn plan_duplicates_to_remove<'a>(
+    groups: &'a [DuplicateGroup],
+    folder_groups: &'a [FolderGroup],
+) -> (FoldersToRemove<'a>, FilesToRemove<'a>) {
+    let folders_to_remove: Vec<(&FolderGroup, &PathBuf)> =
+        folder_groups.iter().filter(|fg| fg.confirmed).flat_map(|fg| fg.paths[1..].iter().map(move |p| (fg, p))).collect();
+    let remove_dirs: Vec<PathBuf> = folders_to_remove.iter().map(|(_, p)| (*p).clone()).collect();
+
+    // Re-derive keep/remove among paths not already covered by a folder-level
+    // removal, rather than blindly trusting group.paths[0]/[1:] -- otherwise
+    // a file whose "kept" copy sits in a folder being bulk-removed could end
+    // up with every copy gone.
+    let mut files_to_remove: Vec<(&DuplicateGroup, &PathBuf)> = Vec::new();
     for group in groups {
-        let remaining: Vec<&PathBuf> = group.paths.iter().filter(|p| !under_any(p, &delete_dirs)).collect();
+        let remaining: Vec<&PathBuf> = group.paths.iter().filter(|p| !under_any(p, &remove_dirs)).collect();
         if remaining.len() < 2 {
             continue;
         }
         for p in &remaining[1..] {
-            files_to_delete.push((group, p));
+            files_to_remove.push((group, p));
         }
     }
+
+    (folders_to_remove, files_to_remove)
+}
+
+/// Where `path` lands under `dest_root`, preserving its full source
+/// hierarchy -- mirrors the drive/root too (e.g. D:\Photos\a.jpg ->
+/// dest_root/D/Photos/a.jpg, /home/user/a.jpg -> dest_root/home/user/a.jpg)
+/// so duplicates that happen to share a relative path under different
+/// scanned directories -- or different drives entirely -- never collide at
+/// the destination.
+fn mirrored_path(path: &Path, dest_root: &Path) -> PathBuf {
+    let mut result = dest_root.to_path_buf();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                let raw = prefix.as_os_str().to_string_lossy();
+                result.push(raw.trim_end_matches(':'));
+            }
+            std::path::Component::RootDir | std::path::Component::CurDir | std::path::Component::ParentDir => {}
+            std::path::Component::Normal(part) => result.push(part),
+        }
+    }
+    result
+}
+
+fn move_path(src: &Path, dest: &Path) -> io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(_) if src.is_dir() => {
+            copy_dir_all(src, dest)?;
+            std::fs::remove_dir_all(src)
+        }
+        Err(_) => {
+            std::fs::copy(src, dest)?;
+            std::fs::remove_file(src)
+        }
+    }
+}
+
+fn copy_dir_all(src: &Path, dest: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest_path = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn delete_duplicates(groups: &[DuplicateGroup], folder_groups: &[FolderGroup], skip_confirmation: bool, dry_run: bool) -> anyhow::Result<()> {
+    let (folders_to_delete, files_to_delete) = plan_duplicates_to_remove(groups, folder_groups);
 
     if folders_to_delete.is_empty() && files_to_delete.is_empty() {
         return Ok(());
@@ -358,9 +439,123 @@ fn delete_duplicates(groups: &[DuplicateGroup], folder_groups: &[FolderGroup], s
     Ok(())
 }
 
+fn move_duplicates(
+    groups: &[DuplicateGroup],
+    folder_groups: &[FolderGroup],
+    dest_root: &Path,
+    skip_confirmation: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let (folders_to_move, files_to_move) = plan_duplicates_to_remove(groups, folder_groups);
+
+    if folders_to_move.is_empty() && files_to_move.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("\nDry run -- nothing will actually be moved to {}.", dest_root.display());
+    } else if !skip_confirmation {
+        let mut parts = Vec::new();
+        if !folders_to_move.is_empty() {
+            parts.push(format!("{} folder(s)", folders_to_move.len()));
+        }
+        if !files_to_move.is_empty() {
+            parts.push(format!("{} file(s)", files_to_move.len()));
+        }
+        print!("\nMove {} to {}? [y/N] ", parts.join(" and "), dest_root.display());
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer).is_err() {
+            answer.clear();
+        }
+        let answer = answer.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Aborted -- nothing moved.");
+            return Ok(());
+        }
+    }
+
+    if !dry_run {
+        std::fs::create_dir_all(dest_root)?;
+    }
+
+    let mut moved_folders = 0;
+    let mut moved_files = 0;
+    let mut failures: Vec<String> = Vec::new();
+
+    for (_fg, path) in &folders_to_move {
+        let dest = mirrored_path(path, dest_root);
+        if dest.exists() {
+            failures.push(format!("{}: destination {} already exists -- skipped", path.display(), dest.display()));
+            continue;
+        }
+        if dry_run {
+            println!("  would move folder: {} -> {}", path.display(), dest.display());
+            moved_folders += 1;
+            continue;
+        }
+        match move_path(path, &dest) {
+            Ok(()) => moved_folders += 1,
+            Err(e) => failures.push(format!("{}: {}", path.display(), e)),
+        }
+    }
+
+    for (group, path) in &files_to_move {
+        if !group.confirmed {
+            match dedupe::files_equal(&group.paths[0], path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let skip_verb = if dry_run { "would be skipped" } else { "skipped" };
+                    failures.push(format!(
+                        "{}: not verified as an actual duplicate of the kept file -- {} rather than risk moving a non-duplicate",
+                        path.display(),
+                        skip_verb
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    failures.push(format!("{}: could not verify against kept file: {}", path.display(), e));
+                    continue;
+                }
+            }
+        }
+        let dest = mirrored_path(path, dest_root);
+        if dest.exists() {
+            failures.push(format!("{}: destination {} already exists -- skipped", path.display(), dest.display()));
+            continue;
+        }
+        if dry_run {
+            println!("  would move: {} -> {}", path.display(), dest.display());
+            moved_files += 1;
+            continue;
+        }
+        match move_path(path, &dest) {
+            Ok(()) => moved_files += 1,
+            Err(e) => failures.push(format!("{}: {}", path.display(), e)),
+        }
+    }
+
+    let verb = if dry_run { "Would move" } else { "Moved" };
+    println!("\n{} {} folder(s) and {} file(s) to {}.", verb, moved_folders, moved_files, dest_root.display());
+    if !failures.is_empty() {
+        let label = if dry_run { "would not be moved" } else { "were not moved" };
+        println!("{} item(s) {}:", failures.len(), label);
+        for line in &failures {
+            println!("  {}", line);
+        }
+    }
+
+    Ok(())
+}
+
 pub fn run() -> anyhow::Result<i32> {
     let cli = Cli::parse();
     let _ = cli.verbose; // verbosity only ever gated internal logging in the Python original; no-op here.
+
+    if cli.delete && cli.move_to.is_some() {
+        println!("Error: --delete and --move-to are mutually exclusive");
+        return Ok(1);
+    }
 
     if cli.history {
         print_history()?;
@@ -523,6 +718,13 @@ pub fn run() -> anyhow::Result<i32> {
 
     if cli.delete && (!groups.is_empty() || !result.folder_groups.is_empty()) {
         delete_duplicates(&groups, &result.folder_groups, cli.yes, cli.dry_run)?;
+    }
+
+    if let Some(move_to) = &cli.move_to {
+        if !groups.is_empty() || !result.folder_groups.is_empty() {
+            let dest_root = resolve_path(move_to)?;
+            move_duplicates(&groups, &result.folder_groups, &dest_root, cli.yes, cli.dry_run)?;
+        }
     }
 
     Ok(0)
