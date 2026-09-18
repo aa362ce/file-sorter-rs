@@ -421,25 +421,58 @@ struct BucketResult {
     processed_count: usize,
 }
 
-fn resolve_bucket(paths: &[PathBuf]) -> BucketResult {
+/// Below this size, a bucket's representative is read into memory once and
+/// compared/hashed from there instead of being reopened once per other
+/// member (plus again for the final hash) -- a bucket of small duplicate-
+/// heavy files would otherwise pay for k+1 opens of the same file rather
+/// than 1. Large/unknown-size buckets keep the existing chunked, early-exit
+/// comparison so a huge file is never read further than its first
+/// difference.
+const CACHED_COMPARE_THRESHOLD: u64 = 256 * 1024;
+
+fn compare_cached(data: &[u8], other: &Path) -> io::Result<bool> {
+    let mut f = File::open(other)?;
+    let mut buf = Vec::with_capacity(data.len());
+    f.read_to_end(&mut buf)?;
+    Ok(buf == data)
+}
+
+fn resolve_bucket(size: u64, paths: &[PathBuf]) -> BucketResult {
     let mut remaining: Vec<PathBuf> = paths.to_vec();
     let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
     let mut skipped: Vec<PathBuf> = Vec::new();
     let mut processed_count = 0usize;
+    let is_small = size < CACHED_COMPARE_THRESHOLD;
 
     while remaining.len() >= 2 {
         let representative = remaining.remove(0);
-        if File::open(&representative).is_err() {
-            skipped.push(representative);
-            processed_count += 1;
-            continue;
-        }
+        let representative_data = if is_small {
+            match std::fs::read(&representative) {
+                Ok(data) => Some(data),
+                Err(_) => {
+                    skipped.push(representative);
+                    processed_count += 1;
+                    continue;
+                }
+            }
+        } else {
+            if File::open(&representative).is_err() {
+                skipped.push(representative);
+                processed_count += 1;
+                continue;
+            }
+            None
+        };
         processed_count += 1;
         let rest = std::mem::take(&mut remaining);
         let mut leftover = Vec::new();
         let mut matched = Vec::new();
         for other in rest {
-            match files_equal(&representative, &other) {
+            let result = match &representative_data {
+                Some(data) => compare_cached(data, &other),
+                None => files_equal(&representative, &other),
+            };
+            match result {
                 Ok(true) => {
                     matched.push(other);
                     processed_count += 1;
@@ -452,7 +485,15 @@ fn resolve_bucket(paths: &[PathBuf]) -> BucketResult {
             }
         }
         if !matched.is_empty() {
-            match full_hash(&representative) {
+            let digest = match &representative_data {
+                Some(data) => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(data);
+                    Ok(format!("{:x}", hasher.finalize()))
+                }
+                None => full_hash(&representative),
+            };
+            match digest {
                 Ok(digest) => {
                     let mut group_paths = vec![representative];
                     group_paths.extend(matched);
@@ -757,12 +798,12 @@ pub fn find_duplicates(
         let full_total: usize = buckets.iter().map(|(_, p)| p.len()).sum();
         let progress = Progress::new("Confirm duplicates", Some(full_total as u64), opts.show_progress);
 
-        let mut batches: Vec<Vec<Vec<PathBuf>>> = Vec::new();
-        let mut current_batch: Vec<Vec<PathBuf>> = Vec::new();
+        let mut batches: Vec<Vec<(u64, Vec<PathBuf>)>> = Vec::new();
+        let mut current_batch: Vec<(u64, Vec<PathBuf>)> = Vec::new();
         let mut current_count = 0usize;
-        for (_, paths) in buckets {
+        for (size, paths) in buckets {
             current_count += paths.len();
-            current_batch.push(paths);
+            current_batch.push((size, paths));
             if current_count >= BATCH_SIZE {
                 batches.push(std::mem::take(&mut current_batch));
                 current_count = 0;
@@ -778,7 +819,8 @@ pub fn find_duplicates(
                 cancelled_stage = Some("full_hash");
                 break;
             }
-            let results: Vec<BucketResult> = pool.install(|| batch.par_iter().map(|paths| resolve_bucket(paths)).collect());
+            let results: Vec<BucketResult> =
+                pool.install(|| batch.par_iter().map(|(size, paths)| resolve_bucket(*size, paths)).collect());
 
             let mut new_entries: Vec<(String, String)> = Vec::new();
             let mut new_skipped: Vec<String> = Vec::new();
