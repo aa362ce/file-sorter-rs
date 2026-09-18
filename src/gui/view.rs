@@ -1,5 +1,5 @@
 use chrono::{Local, TimeZone};
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Column, Row};
+use iced::widget::{button, checkbox, column, container, responsive, row, scrollable, text, text_input, Column, Row};
 use iced::{Center, Element, Fill, Length};
 
 use crate::dedupe;
@@ -167,21 +167,39 @@ fn options_form(app: &App) -> Element<'_, Message> {
 }
 
 fn file_type_grid(app: &App) -> Element<'_, Message> {
-    let mut grid = Row::new().spacing(10);
-    for name in dedupe::valid_file_types() {
-        let checked = app.file_type_filter.contains(name);
-        let name_owned = name.to_string();
-        grid = grid.push(checkbox(checked).label(name).on_toggle(move |v| Message::ToggleFileType(name_owned.clone(), v)).size(15).text_size(13));
-    }
-    let hint = text("Leave all unchecked to scan every file type.").size(11).color(style::MUTED);
-    column![wrap(grid), hint].spacing(6).into()
-}
+    let checkboxes: Vec<(&'static str, bool)> =
+        dedupe::valid_file_types().into_iter().map(|name| (name, app.file_type_filter.contains(name))).collect();
 
-/// `Row` doesn't wrap on its own, but the type-filter list is short enough
-/// that a plain row (allowed to overflow into the scroll area) reads fine
-/// without pulling in a wrapping layout just for this.
-fn wrap(row: Row<'_, Message>) -> Element<'_, Message> {
-    scrollable(row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(4).scroller_width(4))).into()
+    // The type-filter list wraps onto as many rows as the panel's actual
+    // width allows, instead of overflowing into a horizontal scrollbar.
+    let grid = responsive(move |size| {
+        const SPACING: f32 = 10.0;
+        let item_width = |name: &str| 34.0 + name.chars().count() as f32 * 7.5;
+
+        let mut rows = Column::new().spacing(8);
+        let mut current_row = Row::new().spacing(SPACING);
+        let mut current_width = 0.0_f32;
+
+        for (name, checked) in checkboxes.iter().copied() {
+            let width = item_width(name);
+            if current_width > 0.0 && current_width + SPACING + width > size.width {
+                rows = rows.push(current_row);
+                current_row = Row::new().spacing(SPACING);
+                current_width = 0.0;
+            }
+            current_width += if current_width > 0.0 { SPACING + width } else { width };
+
+            let name_owned = name.to_string();
+            current_row = current_row
+                .push(checkbox(checked).label(name).on_toggle(move |v| Message::ToggleFileType(name_owned.clone(), v)).size(15).text_size(13));
+        }
+
+        rows.push(current_row).into()
+    })
+    .height(Length::Shrink);
+
+    let hint = text("Leave all unchecked to scan every file type.").size(11).color(style::MUTED);
+    column![grid, hint].spacing(6).into()
 }
 
 fn scan_controls(app: &App) -> Element<'_, Message> {
