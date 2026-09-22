@@ -40,6 +40,13 @@ struct Cli {
     #[arg(long, default_value_t = dedupe::LARGE_FILE_THRESHOLD, value_name = "BYTES")]
     large_threshold: u64,
 
+    /// Folders below this size are hashed as a single unit (their whole recursive contents
+    /// read and hashed in one pass) to find duplicate folders, instead of relying on the
+    /// slower, more granular per-file duplicate index. Folders at or above this size keep
+    /// using the per-file index instead of being re-read whole.
+    #[arg(long, default_value_t = dedupe::FOLDER_HASH_THRESHOLD, value_name = "BYTES")]
+    folder_hash_threshold: u64,
+
     /// Directory name to skip entirely wherever it's encountered -- repeatable
     #[arg(long = "exclude", value_name = "NAME")]
     exclude: Vec<String>,
@@ -682,6 +689,7 @@ pub fn run() -> anyhow::Result<i32> {
         exclude_dirs,
         exclude_temp_files,
         file_types: file_types_set,
+        folder_hash_threshold: cli.folder_hash_threshold,
     };
 
     let start = std::time::Instant::now();

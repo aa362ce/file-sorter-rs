@@ -44,9 +44,10 @@ pub enum Phase {
     Acting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingAction {
     Trash,
+    MoveTo(PathBuf),
 }
 
 pub struct App {
@@ -58,6 +59,7 @@ pub struct App {
     pub min_size_mb: String,
     pub threads: String,
     pub large_threshold_mb: String,
+    pub folder_hash_threshold_mb: String,
     pub exclude_input: String,
     pub excludes: Vec<String>,
     pub use_default_excludes: bool,
@@ -98,6 +100,7 @@ impl Default for App {
             min_size_mb: "0".to_string(),
             threads: "0".to_string(),
             large_threshold_mb: "500".to_string(),
+            folder_hash_threshold_mb: "500".to_string(),
             exclude_input: String::new(),
             excludes: Vec::new(),
             use_default_excludes: true,
@@ -136,6 +139,7 @@ pub enum Message {
     MinSizeChanged(String),
     ThreadsChanged(String),
     LargeThresholdChanged(String),
+    FolderHashThresholdChanged(String),
     ExcludeInputChanged(String),
     AddExclude,
     RemoveExclude(usize),
@@ -203,6 +207,8 @@ impl App {
         };
         exclude_dirs.extend(self.excludes.iter().map(|s| s.to_lowercase()));
 
+        let folder_hash_threshold = parse_mb(&self.folder_hash_threshold_mb).unwrap_or(500.0);
+
         ScanOptions {
             show_progress: false,
             workers: self.threads.trim().parse::<usize>().unwrap_or(0),
@@ -210,6 +216,7 @@ impl App {
             exclude_dirs,
             exclude_temp_files: self.exclude_temp_files,
             file_types: if self.file_type_filter.is_empty() { None } else { Some(self.file_type_filter.clone()) },
+            folder_hash_threshold: mb_to_bytes(folder_hash_threshold),
         }
     }
 
@@ -348,6 +355,12 @@ impl App {
             Message::LargeThresholdChanged(v) => {
                 if v.chars().all(|c| c.is_ascii_digit() || c == '.') {
                     self.large_threshold_mb = v;
+                }
+                Task::none()
+            }
+            Message::FolderHashThresholdChanged(v) => {
+                if v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                    self.folder_hash_threshold_mb = v;
                 }
                 Task::none()
             }
@@ -514,13 +527,15 @@ impl App {
             Message::RequestMoveTo => Task::perform(worker::pick_folder("Choose a destination folder"), Message::MoveDestPicked),
             Message::MoveDestPicked(dest) => {
                 if let Some(dest) = dest {
-                    self.run_action(ActionKind::MoveTo(dest));
+                    self.confirm = Some(PendingAction::MoveTo(dest));
                 }
                 Task::none()
             }
             Message::ConfirmAction => {
-                if let Some(PendingAction::Trash) = self.confirm.take() {
-                    self.run_action(ActionKind::Trash);
+                match self.confirm.take() {
+                    Some(PendingAction::Trash) => self.run_action(ActionKind::Trash),
+                    Some(PendingAction::MoveTo(dest)) => self.run_action(ActionKind::MoveTo(dest)),
+                    None => {}
                 }
                 Task::none()
             }
