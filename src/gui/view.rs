@@ -122,6 +122,12 @@ fn options_form(app: &App) -> Element<'_, Message> {
     let numeric_row = column![
         labeled_input("Minimum size", "MB (0 = no minimum)", &app.min_size_mb, Message::MinSizeChanged),
         labeled_input("Large-file threshold", "MB (defer full hash above this)", &app.large_threshold_mb, Message::LargeThresholdChanged),
+        labeled_input(
+            "Folder-hash threshold",
+            "MB (hash whole folder at once below this)",
+            &app.folder_hash_threshold_mb,
+            Message::FolderHashThresholdChanged,
+        ),
         labeled_input("Worker threads", "0 = one per core", &app.threads, Message::ThreadsChanged),
     ]
     .spacing(8);
@@ -289,8 +295,8 @@ fn results_view<'a>(app: &'a App) -> Element<'a, Message> {
         ResultsView::Folders => sections = sections.push(selection_bar(app, false)).push(folder_groups(app)),
     }
 
-    if let Some(PendingAction::Trash) = app.confirm {
-        sections = sections.push(confirm_bar());
+    if let Some(action) = &app.confirm {
+        sections = sections.push(confirm_bar(action));
     }
 
     if let Some(report) = &app.last_action_report {
@@ -456,13 +462,18 @@ fn path_row_folder<'a>(gi: usize, pi: usize, path: &'a std::path::Path, checked:
     }
 }
 
-fn confirm_bar<'a>() -> Element<'a, Message> {
+fn confirm_bar(action: &PendingAction) -> Element<'_, Message> {
+    let (prompt, confirm_label) = match action {
+        PendingAction::Trash => ("Move every checked item to the Trash?".to_string(), "Yes, move to Trash".to_string()),
+        PendingAction::MoveTo(dest) => (format!("Move every checked item to {}?", dest.display()), "Yes, move".to_string()),
+    };
+
     container(
         row![
-            text("Move every checked item to the Trash?").size(13),
+            text(prompt).size(13),
             horizontal_space(),
             button(text("Cancel").size(13)).style(style::ghost_button).padding([8, 14]).on_press(Message::CancelConfirm),
-            button(text("Yes, move to Trash").size(13)).style(button::danger).padding([8, 14]).on_press(Message::ConfirmAction),
+            button(text(confirm_label).size(13)).style(button::danger).padding([8, 14]).on_press(Message::ConfirmAction),
         ]
         .align_y(Center)
         .spacing(10),

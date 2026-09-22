@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::dedupe::DuplicateGroup;
+use crate::dedupe::{full_hash, DuplicateGroup};
 use crate::progress::Progress;
 
 /// Two or more directories whose entire recursive contents are byte-for-byte
@@ -61,26 +61,39 @@ fn mark_covered(start: PathBuf, covered: &mut HashSet<PathBuf>, dir_subdirs: &Ha
 }
 
 /// Find directories whose entire recursive file contents exactly match
-/// another directory's, built entirely on top of already-computed file-level
-/// duplicate groups rather than doing any extra hashing.
+/// another directory's.
 ///
-/// A directory is only a candidate if every file under it (recursively)
-/// already has a match somewhere in `groups` -- a directory containing even
-/// one file with no duplicate anywhere in the scan can never have a matching
-/// sibling. `skipped` (unreadable files) disqualify their directory the same
-/// way: its true contents can't be verified.
+/// Two strategies are used to compute each directory's duplicate signature,
+/// chosen by its total recursive size against `folder_hash_threshold`:
+///
+/// - At or above the threshold, the signature is composed entirely from the
+///   already-computed file-level duplicate `groups` (no extra hashing): a
+///   directory is only a candidate if every file under it (recursively)
+///   already has a match somewhere in `groups` -- a directory containing
+///   even one file with no duplicate anywhere in the scan can never have a
+///   matching sibling. `skipped` (unreadable files) disqualify their
+///   directory the same way: its true contents can't be verified.
+/// - Below the threshold, the directory is small enough that hashing it
+///   directly is cheap, so its signature is computed by reading every file
+///   under it fresh and hashing the whole tree as one unit. This finds
+///   matching small folders even when their individual files were never
+///   large enough (i.e. never had another same-sized sibling anywhere in the
+///   scan) to be picked up by the global per-file duplicate pass.
 ///
 /// Nested duplicates are collapsed: if two directories match, matching
 /// subdirectories under them aren't reported separately, since that's
 /// already implied by the parent match.
+#[allow(clippy::too_many_arguments)]
 pub fn find_duplicate_folders(
     all_files: &[PathBuf],
     skipped: &[PathBuf],
     groups: &[DuplicateGroup],
     scan_roots: &[PathBuf],
     show_progress: bool,
+    file_sizes: &HashMap<PathBuf, u64>,
+    folder_hash_threshold: u64,
 ) -> Vec<FolderGroup> {
-    let mut content_id: HashMap<&std::path::Path, (&str, bool, u64)> = HashMap::new();
+    let mut content_id: HashMap<&Path, (&str, bool, u64)> = HashMap::new();
     for g in groups {
         for p in &g.paths {
             content_id.insert(p.as_path(), (g.file_hash.as_str(), g.confirmed, g.size));
@@ -100,83 +113,62 @@ pub fn find_duplicate_folders(
     }
 
     // Deepest directories first, so a directory's subdirectories are always
-    // already resolved (signature computed, or disqualified) by the time the
-    // directory itself is processed.
+    // already resolved (size/signature computed, or disqualified) by the
+    // time the directory itself is processed.
     let mut ordered: Vec<PathBuf> = known_dirs.into_iter().collect();
     ordered.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
 
-    let mut signature: HashMap<PathBuf, Option<String>> = HashMap::new();
-    let mut confirmed_by_dir: HashMap<PathBuf, bool> = HashMap::new();
+    // Total recursive size/file-count per directory, computed purely from
+    // known file sizes (no hashing) so the threshold check below never pays
+    // for hashing a folder just to decide how to hash it. A file missing
+    // from `file_sizes` (unreadable during the scan) contributes 0 here --
+    // it still disqualifies the directory later, in whichever strategy ends
+    // up handling it.
     let mut size_by_dir: HashMap<PathBuf, u64> = HashMap::new();
     let mut count_by_dir: HashMap<PathBuf, usize> = HashMap::new();
+    for d in &ordered {
+        let mut total_size: u64 = 0;
+        let mut total_count: usize = 0;
+        if let Some(files) = dir_files.get(d) {
+            for f in files {
+                total_size += file_sizes.get(f.as_path()).copied().unwrap_or(0);
+                total_count += 1;
+            }
+        }
+        if let Some(subs) = dir_subdirs.get(d) {
+            for sub in subs {
+                total_size += size_by_dir.get(sub).copied().unwrap_or(0);
+                total_count += count_by_dir.get(sub).copied().unwrap_or(0);
+            }
+        }
+        size_by_dir.insert(d.clone(), total_size);
+        count_by_dir.insert(d.clone(), total_count);
+    }
+
+    let mut signature: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut confirmed_by_dir: HashMap<PathBuf, bool> = HashMap::new();
 
     let progress = Progress::new("Analyzing folders", Some(ordered.len() as u64), show_progress);
 
     for d in &ordered {
         progress.update(1);
-        let mut entries: Vec<(&str, String, String)> = Vec::new();
-        let mut disqualified = false;
-        let mut confirmed = true;
-        let mut total_size: u64 = 0;
-        let mut total_count: usize = 0;
-
-        if let Some(files) = dir_files.get(d) {
-            let mut files_sorted: Vec<&PathBuf> = files.iter().collect();
-            files_sorted.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
-            for f in files_sorted {
-                match content_id.get(f.as_path()) {
-                    None => {
-                        disqualified = true;
-                        break;
-                    }
-                    Some((file_hash, file_confirmed, file_size)) => {
-                        entries.push((
-                            "F",
-                            f.file_name().unwrap().to_string_lossy().to_string(),
-                            file_hash.to_string(),
-                        ));
-                        confirmed = confirmed && *file_confirmed;
-                        total_size += file_size;
-                        total_count += 1;
-                    }
-                }
-            }
-        }
-
-        if !disqualified {
-            if let Some(subs) = dir_subdirs.get(d) {
-                let mut subs_sorted: Vec<&PathBuf> = subs.iter().collect();
-                subs_sorted.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
-                for sub in subs_sorted {
-                    match signature.get(sub) {
-                        Some(Some(sub_sig)) => {
-                            entries.push(("D", sub.file_name().unwrap().to_string_lossy().to_string(), sub_sig.clone()));
-                            confirmed = confirmed && confirmed_by_dir[sub];
-                            total_size += size_by_dir[sub];
-                            total_count += count_by_dir[sub];
-                        }
-                        _ => {
-                            disqualified = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if disqualified || total_count == 0 {
+        if count_by_dir[d] == 0 {
             signature.insert(d.clone(), None);
             continue;
         }
 
-        let repr_str = format!("{:?}", entries);
-        let mut hasher = Sha256::new();
-        hasher.update(repr_str.as_bytes());
-        let sig = format!("{:x}", hasher.finalize());
-        signature.insert(d.clone(), Some(sig));
-        confirmed_by_dir.insert(d.clone(), confirmed);
-        size_by_dir.insert(d.clone(), total_size);
-        count_by_dir.insert(d.clone(), total_count);
+        let (sig, confirmed) = if size_by_dir[d] < folder_hash_threshold {
+            hash_folder_direct(d, &dir_files, &dir_subdirs, &signature)
+        } else {
+            hash_folder_from_index(d, &dir_files, &dir_subdirs, &content_id, &signature, &confirmed_by_dir)
+        };
+
+        if let Some(sig) = sig {
+            signature.insert(d.clone(), Some(sig));
+            confirmed_by_dir.insert(d.clone(), confirmed);
+        } else {
+            signature.insert(d.clone(), None);
+        }
     }
     progress.close();
 
@@ -213,4 +205,98 @@ pub fn find_duplicate_folders(
 
     result.sort_by_key(|g| std::cmp::Reverse(g.size * g.paths.len() as u64));
     result
+}
+
+/// Composes a directory's signature from already-known per-file/per-subdir
+/// duplicate hashes (`content_id`/`signature`), disqualifying it (`None`) if
+/// any direct file or subdirectory isn't itself already known to match
+/// something else in the scan.
+fn hash_folder_from_index(
+    dir: &Path,
+    dir_files: &HashMap<PathBuf, Vec<PathBuf>>,
+    dir_subdirs: &HashMap<PathBuf, HashSet<PathBuf>>,
+    content_id: &HashMap<&Path, (&str, bool, u64)>,
+    signature: &HashMap<PathBuf, Option<String>>,
+    confirmed_by_dir: &HashMap<PathBuf, bool>,
+) -> (Option<String>, bool) {
+    let mut entries: Vec<(&str, String, String)> = Vec::new();
+    let mut confirmed = true;
+
+    if let Some(files) = dir_files.get(dir) {
+        let mut files_sorted: Vec<&PathBuf> = files.iter().collect();
+        files_sorted.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
+        for f in files_sorted {
+            match content_id.get(f.as_path()) {
+                None => return (None, false),
+                Some((file_hash, file_confirmed, _)) => {
+                    entries.push(("F", f.file_name().unwrap().to_string_lossy().to_string(), file_hash.to_string()));
+                    confirmed = confirmed && *file_confirmed;
+                }
+            }
+        }
+    }
+
+    if let Some(subs) = dir_subdirs.get(dir) {
+        let mut subs_sorted: Vec<&PathBuf> = subs.iter().collect();
+        subs_sorted.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
+        for sub in subs_sorted {
+            match signature.get(sub) {
+                Some(Some(sub_sig)) => {
+                    entries.push(("D", sub.file_name().unwrap().to_string_lossy().to_string(), sub_sig.clone()));
+                    confirmed = confirmed && confirmed_by_dir.get(sub).copied().unwrap_or(false);
+                }
+                _ => return (None, false),
+            }
+        }
+    }
+
+    (Some(hash_entries(&entries)), confirmed)
+}
+
+/// Composes a directory's signature by reading and hashing its contents
+/// directly from disk right now, rather than requiring every file to already
+/// be a known duplicate elsewhere in the scan. Only used for directories
+/// under `folder_hash_threshold`, where the extra read is cheap. An
+/// unreadable file disqualifies the directory (`None`), the same as a
+/// `content_id` miss does in `hash_folder_from_index`.
+fn hash_folder_direct(
+    dir: &Path,
+    dir_files: &HashMap<PathBuf, Vec<PathBuf>>,
+    dir_subdirs: &HashMap<PathBuf, HashSet<PathBuf>>,
+    signature: &HashMap<PathBuf, Option<String>>,
+) -> (Option<String>, bool) {
+    let mut entries: Vec<(&str, String, String)> = Vec::new();
+
+    if let Some(files) = dir_files.get(dir) {
+        let mut files_sorted: Vec<&PathBuf> = files.iter().collect();
+        files_sorted.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
+        for f in files_sorted {
+            match full_hash(f) {
+                Ok(hash) => entries.push(("F", f.file_name().unwrap().to_string_lossy().to_string(), hash)),
+                Err(_) => return (None, false),
+            }
+        }
+    }
+
+    if let Some(subs) = dir_subdirs.get(dir) {
+        let mut subs_sorted: Vec<&PathBuf> = subs.iter().collect();
+        subs_sorted.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
+        for sub in subs_sorted {
+            match signature.get(sub) {
+                Some(Some(sub_sig)) => entries.push(("D", sub.file_name().unwrap().to_string_lossy().to_string(), sub_sig.clone())),
+                _ => return (None, false),
+            }
+        }
+    }
+
+    // Hashed just now from live content, so unlike a deferred large-file
+    // match, this is always fully confirmed.
+    (Some(hash_entries(&entries)), true)
+}
+
+fn hash_entries(entries: &[(&str, String, String)]) -> String {
+    let repr_str = format!("{:?}", entries);
+    let mut hasher = Sha256::new();
+    hasher.update(repr_str.as_bytes());
+    format!("{:x}", hasher.finalize())
 }

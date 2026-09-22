@@ -16,6 +16,11 @@ pub const PARTIAL_CHUNK_SIZE: usize = 8192;
 pub const FULL_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const LARGE_FILE_THRESHOLD: u64 = 500 * 1024 * 1024; // 500MB
 
+/// Below this size, a folder's duplicate signature is computed by directly
+/// hashing its full recursive contents in one pass rather than composing it
+/// from the global per-file duplicate groups (see `find_duplicate_folders`).
+pub const FOLDER_HASH_THRESHOLD: u64 = 500 * 1024 * 1024; // 500MB
+
 /// How many files a hash/confirm stage processes between checkpoint saves --
 /// frequent enough that a crash loses at most this many files' worth of
 /// work, infrequent enough that the checkpoint write itself never becomes
@@ -193,7 +198,7 @@ fn partial_hash(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn full_hash(path: &Path) -> io::Result<String> {
+pub(crate) fn full_hash(path: &Path) -> io::Result<String> {
     let mut f = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; FULL_READ_CHUNK_SIZE];
@@ -401,6 +406,9 @@ pub struct ScanOptions {
     pub exclude_dirs: HashSet<String>,
     pub exclude_temp_files: bool,
     pub file_types: Option<HashSet<String>>,
+    /// Folders smaller than this are hashed as a single unit rather than via
+    /// the per-file duplicate index -- see `FOLDER_HASH_THRESHOLD`.
+    pub folder_hash_threshold: u64,
 }
 
 impl Default for ScanOptions {
@@ -412,6 +420,7 @@ impl Default for ScanOptions {
             exclude_dirs: DEFAULT_EXCLUDED_DIR_NAMES.iter().map(|s| s.to_string()).collect(),
             exclude_temp_files: true,
             file_types: None,
+            folder_hash_threshold: FOLDER_HASH_THRESHOLD,
         }
     }
 }
@@ -916,7 +925,21 @@ pub fn find_duplicates(
     let mut folder_groups: Vec<FolderGroup> = Vec::new();
     if !cancelled {
         let all_files: Vec<PathBuf> = by_size.values().flatten().cloned().collect();
-        folder_groups = find_duplicate_folders(&all_files, &skipped, &groups, directories, opts.show_progress);
+        let mut file_sizes: HashMap<PathBuf, u64> = HashMap::new();
+        for (size, paths) in &by_size {
+            for p in paths {
+                file_sizes.insert(p.clone(), *size);
+            }
+        }
+        folder_groups = find_duplicate_folders(
+            &all_files,
+            &skipped,
+            &groups,
+            directories,
+            opts.show_progress,
+            &file_sizes,
+            opts.folder_hash_threshold,
+        );
     }
 
     Ok(ScanResult { groups, skipped, cancelled, resume_state: new_resume_state, folder_groups, reused_run_id: None })
