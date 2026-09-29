@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::folders::{find_duplicate_folders, FolderGroup};
+use crate::folders::{find_duplicate_folders, unit_signature, FolderGroup, UnitFolder};
 use crate::progress::Progress;
 use crate::store::{self, CheckpointDelta, ResumeState};
 
@@ -16,9 +16,9 @@ pub const PARTIAL_CHUNK_SIZE: usize = 8192;
 pub const FULL_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const LARGE_FILE_THRESHOLD: u64 = 500 * 1024 * 1024; // 500MB
 
-/// Below this size, a folder's duplicate signature is computed by directly
-/// hashing its full recursive contents in one pass rather than composing it
-/// from the global per-file duplicate groups (see `find_duplicate_folders`).
+/// Below this size, a non-root folder is treated as a single unit: the scan
+/// never descends into it as individual files, it is hashed as a whole, and
+/// it is deleted/moved as one item (see `walk_checkpointed`).
 pub const FOLDER_HASH_THRESHOLD: u64 = 500 * 1024 * 1024; // 500MB
 
 /// How many files a hash/confirm stage processes between checkpoint saves --
@@ -239,6 +239,10 @@ fn dir_identity(path: &Path) -> String {
 enum WalkEvent {
     File(PathBuf),
     DirDone(String),
+    /// A non-root directory whose total (filtered) size is below the walk's
+    /// unit threshold. It is reported as one entry and never descended into;
+    /// `files` lists everything under it so it can be signed as a whole.
+    Folder { path: PathBuf, size: u64, files: Vec<PathBuf> },
 }
 
 fn try_push(
@@ -260,6 +264,53 @@ fn try_push(
     }
 }
 
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
+/// Totals up everything under `dir` (same filtering as the main walk) without
+/// hashing. Returns `None` if the folder is empty, would reach `limit` bytes
+/// (the walk stops counting as soon as it does), or `cancel` fired -- in all
+/// those cases the caller should treat it as an ordinary directory.
+fn measure_folder(
+    dir: &Path,
+    limit: u64,
+    excluded_names: &HashSet<String>,
+    extension_filter: Option<&ExtensionFilter>,
+    exclude_temp_files: bool,
+    cancel: Option<&AtomicBool>,
+) -> Option<(u64, Vec<PathBuf>)> {
+    let mut size = 0u64;
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut too_big = false;
+    walk_checkpointed(
+        &[dir.to_path_buf()],
+        &HashSet::new(),
+        &HashSet::new(),
+        excluded_names,
+        extension_filter,
+        exclude_temp_files,
+        0,
+        cancel,
+        |event| {
+            if let WalkEvent::File(p) = event {
+                size += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                if size >= limit {
+                    too_big = true;
+                    return false;
+                }
+                files.push(p);
+            }
+            true
+        },
+    );
+    if too_big || files.is_empty() || is_cancelled(cancel) {
+        None
+    } else {
+        Some((size, files))
+    }
+}
+
 /// Recursively yields every file under `directories`, resumable at directory
 /// granularity. Follows directory symlinks but never re-enters a real
 /// directory already visited (cycle-safe); file symlinks are skipped
@@ -269,6 +320,10 @@ fn try_push(
 /// descended into; a root in `directories` itself is always scanned
 /// regardless of its name. `on_event` returning `false` stops the walk
 /// immediately (used for cancellation).
+///
+/// With a non-zero `unit_threshold`, a non-root subdirectory whose total size
+/// is below it is not descended into: it is reported as a single
+/// `WalkEvent::Folder` instead, so it can be deleted/moved as one item.
 #[allow(clippy::too_many_arguments)]
 fn walk_checkpointed(
     directories: &[PathBuf],
@@ -277,6 +332,8 @@ fn walk_checkpointed(
     excluded_names: &HashSet<String>,
     extension_filter: Option<&ExtensionFilter>,
     exclude_temp_files: bool,
+    unit_threshold: u64,
+    cancel: Option<&AtomicBool>,
     mut on_event: impl FnMut(WalkEvent) -> bool,
 ) {
     let mut visited: HashSet<String> = HashSet::new();
@@ -287,6 +344,9 @@ fn walk_checkpointed(
     }
 
     while let Some((entries, _)) = stack.last_mut() {
+        if is_cancelled(cancel) {
+            return;
+        }
         let next = entries.next();
         match next {
             None => {
@@ -302,21 +362,32 @@ fn walk_checkpointed(
                     Ok(ft) => ft,
                     Err(_) => continue,
                 };
-                if file_type.is_symlink() {
+                let is_dir = if file_type.is_symlink() {
                     match std::fs::metadata(&path) {
-                        Ok(md) if md.is_dir() => {
-                            let name = entry.file_name().to_string_lossy().to_lowercase();
-                            if excluded_names.contains(&name) {
-                                continue;
-                            }
-                            try_push(&path, completed_dirs, &mut stack, &mut visited);
-                        }
+                        Ok(md) if md.is_dir() => true,
                         _ => continue,
                     }
-                } else if file_type.is_dir() {
+                } else {
+                    file_type.is_dir()
+                };
+                if is_dir {
                     let name = entry.file_name().to_string_lossy().to_lowercase();
                     if excluded_names.contains(&name) {
                         continue;
+                    }
+                    if unit_threshold > 0 {
+                        let key = dir_identity(&path);
+                        if !visited.contains(&key) && !completed_dirs.contains(&key) {
+                            if let Some((size, files)) =
+                                measure_folder(&path, unit_threshold, excluded_names, extension_filter, exclude_temp_files, cancel)
+                            {
+                                visited.insert(key);
+                                if !on_event(WalkEvent::Folder { path, size, files }) {
+                                    return;
+                                }
+                                continue;
+                            }
+                        }
                     }
                     try_push(&path, completed_dirs, &mut stack, &mut visited);
                 } else if file_type.is_file() {
@@ -406,8 +477,8 @@ pub struct ScanOptions {
     pub exclude_dirs: HashSet<String>,
     pub exclude_temp_files: bool,
     pub file_types: Option<HashSet<String>>,
-    /// Folders smaller than this are hashed as a single unit rather than via
-    /// the per-file duplicate index -- see `FOLDER_HASH_THRESHOLD`.
+    /// Non-root folders smaller than this are kept as a single entry and not
+    /// traversed file by file; 0 disables this -- see `FOLDER_HASH_THRESHOLD`.
     pub folder_hash_threshold: u64,
 }
 
@@ -578,7 +649,14 @@ pub fn find_duplicates(
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     let mut completed_dirs: HashSet<String> = HashSet::new();
 
-    if matches!(resume_stage.as_deref(), Some("quick_hash") | Some("full_hash")) {
+    // On a resume from a hash stage the file list is already restored from
+    // the checkpoint; the walk still runs so folders treated as single units
+    // (which are never checkpointed) are found again, but it records nothing
+    // else.
+    let hash_resume = matches!(resume_stage.as_deref(), Some("quick_hash") | Some("full_hash"));
+    let mut unit_folders: Vec<(PathBuf, u64, Vec<PathBuf>)> = Vec::new();
+    let mut already_seen: HashSet<PathBuf> = HashSet::new();
+    if hash_resume || resume_stage.as_deref() == Some("scanning") {
         let rs = resume_state.as_ref().unwrap();
         for (size_str, paths) in &rs.by_size {
             if let Ok(size) = size_str.parse::<u64>() {
@@ -586,23 +664,15 @@ pub fn find_duplicates(
             }
         }
         skipped.extend(rs.skipped.iter().map(PathBuf::from));
-    } else {
-        let mut already_seen: HashSet<PathBuf> = HashSet::new();
-        if resume_stage.as_deref() == Some("scanning") {
-            let rs = resume_state.as_ref().unwrap();
-            for (size_str, paths) in &rs.by_size {
-                if let Ok(size) = size_str.parse::<u64>() {
-                    by_size.insert(size, paths.iter().map(PathBuf::from).collect());
-                }
-            }
-            already_seen = by_size.values().flatten().cloned().collect();
-            completed_dirs = rs.completed_dirs.iter().cloned().collect();
-            skipped.extend(rs.skipped.iter().map(PathBuf::from));
-            already_seen.extend(skipped.iter().cloned());
-        }
+        already_seen = by_size.values().flatten().cloned().collect();
+        already_seen.extend(skipped.iter().cloned());
+    }
 
-        let completed_snapshot = completed_dirs.clone();
-        let progress = Progress::new("Scanning", None, opts.show_progress);
+    {
+        // Directories are deliberately re-walked on resume (no completed-dir
+        // skipping): the walk is cheap next to hashing, and it is the only
+        // way to rediscover the unit folders.
+        let progress = Progress::new("Scanning", None, opts.show_progress && !hash_resume);
         let mut since_flush: usize = 0;
         let mut pending_entries: Vec<(String, String)> = Vec::new();
         let mut pending_completed: Vec<String> = Vec::new();
@@ -610,16 +680,24 @@ pub fn find_duplicates(
 
         walk_checkpointed(
             directories,
-            &completed_snapshot,
+            &HashSet::new(),
             &already_seen,
             &excluded_names,
             extension_filter.as_ref(),
             opts.exclude_temp_files,
+            opts.folder_hash_threshold,
+            if hash_resume { None } else { Some(cancel) },
             |event| {
-                if cancel.load(Ordering::Relaxed) {
+                if !hash_resume && cancel.load(Ordering::Relaxed) {
                     return false;
                 }
                 match event {
+                    WalkEvent::Folder { path, size, files } => {
+                        progress.update(1);
+                        unit_folders.push((path, size, files));
+                        return true;
+                    }
+                    _ if hash_resume => return true,
                     WalkEvent::DirDone(key) => {
                         completed_dirs.insert(key.clone());
                         pending_completed.push(key);
@@ -656,18 +734,20 @@ pub fn find_duplicates(
                 true
             },
         );
-        flush_stage1(
-            run_id,
-            &mut pending_entries,
-            &mut pending_completed,
-            &mut pending_skipped,
-            &mut directories_sent,
-            &mut root_keys_sent,
-            &directories_str,
-            &root_keys_map,
-        );
+        if !hash_resume {
+            flush_stage1(
+                run_id,
+                &mut pending_entries,
+                &mut pending_completed,
+                &mut pending_skipped,
+                &mut directories_sent,
+                &mut root_keys_sent,
+                &directories_str,
+                &root_keys_map,
+            );
+        }
         progress.close();
-        if cancel.load(Ordering::Relaxed) {
+        if !hash_resume && cancel.load(Ordering::Relaxed) {
             cancelled = true;
             cancelled_stage = Some("scanning");
         }
@@ -931,6 +1011,17 @@ pub fn find_duplicates(
                 file_sizes.insert(p.clone(), *size);
             }
         }
+        let unit_progress = Progress::new("Hashing folders", Some(unit_folders.len() as u64), opts.show_progress);
+        let units: Vec<UnitFolder> = pool.install(|| {
+            unit_folders
+                .par_iter()
+                .map(|(path, size, files)| {
+                    unit_progress.update(1);
+                    UnitFolder { path: path.clone(), size: *size, file_count: files.len(), signature: unit_signature(path, files) }
+                })
+                .collect()
+        });
+        unit_progress.close();
         folder_groups = find_duplicate_folders(
             &all_files,
             &skipped,
@@ -939,6 +1030,7 @@ pub fn find_duplicates(
             opts.show_progress,
             &file_sizes,
             opts.folder_hash_threshold,
+            &units,
         );
     }
 
@@ -994,6 +1086,10 @@ pub fn quick_scan_manifest(
         &excluded_names,
         extension_filter.as_ref(),
         opts.exclude_temp_files,
+        // Every file is stat'ed here, even inside folders the scan itself
+        // treats as single units, so a change anywhere invalidates reuse.
+        0,
+        None,
         |event| {
             if cancel.load(Ordering::Relaxed) {
                 cancelled = true;
@@ -1065,4 +1161,42 @@ pub fn scan_or_reuse(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, data: &[u8]) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, data).unwrap();
+    }
+
+    #[test]
+    fn small_folders_are_single_entries() {
+        let tmp = std::env::temp_dir().join(format!("fs_units_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        write(&tmp, "a/x.txt", b"hello");
+        write(&tmp, "a/sub/y.txt", b"world");
+        write(&tmp, "b/x.txt", b"hello");
+        write(&tmp, "b/sub/y.txt", b"world");
+        write(&tmp, "c/x.txt", b"different");
+
+        let opts = ScanOptions { show_progress: false, folder_hash_threshold: 1024, ..Default::default() };
+        let result = find_duplicates(&[tmp.clone()], &opts, &AtomicBool::new(false), None, "test-units").unwrap();
+        // Files inside unit folders are never reported individually.
+        assert!(result.groups.is_empty());
+        assert_eq!(result.folder_groups.len(), 1);
+        let mut paths = result.folder_groups[0].paths.clone();
+        paths.sort();
+        assert_eq!(paths, vec![tmp.join("a"), tmp.join("b")]);
+        assert_eq!(result.folder_groups[0].file_count, 2);
+
+        // Threshold 0 disables units: files are traversed individually.
+        let opts = ScanOptions { show_progress: false, folder_hash_threshold: 0, ..Default::default() };
+        let result = find_duplicates(&[tmp.clone()], &opts, &AtomicBool::new(false), None, "test-units2").unwrap();
+        assert_eq!(result.groups.len(), 2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

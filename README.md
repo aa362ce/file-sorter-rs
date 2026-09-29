@@ -6,7 +6,7 @@ A fast duplicate-file finder for one or more directories, with a command-line to
 
 - **Parallel hashing** — uses all CPU cores (via [rayon](https://crates.io/crates/rayon)) with SHA-256, comparing file size and a partial hash before committing to a full read.
 - **Large-file handling** — files above a configurable size threshold (default 500 MB) are reported as *probable* duplicates immediately and only fully verified right before deletion/move, so a scan doesn't stall hashing huge files.
-- **Whole-folder duplicate detection** — recognizes when entire directory trees are duplicates of each other, not just individual files.
+- **Whole-folder duplicate detection** — recognizes when entire directory trees are duplicates of each other. Subfolders smaller than `--folder-hash-threshold` (default 500 MB, `0` to disable) are not traversed file by file: each stays a single entry, is hashed as a whole, and is deleted/moved as one folder.
 - **Resumable scans** — a cancelled scan (Ctrl+C) checkpoints its progress and can be picked up later with `--resume`.
 - **Run history** — every scan is recorded locally and can be listed, re-displayed, exported to JSON, or imported.
 - **Safe deletion** — duplicates go to the Trash (recoverable), not `rm`'d directly; `--dry-run` previews any delete/move without touching anything.

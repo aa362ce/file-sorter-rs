@@ -20,6 +20,30 @@ pub struct FolderGroup {
     pub confirmed: bool,
 }
 
+/// A folder the scan treated as one entry (see `dedupe::walk_checkpointed`)
+/// instead of descending into its files. `signature` is `None` if any file
+/// under it couldn't be read, which disqualifies it from matching.
+pub struct UnitFolder {
+    pub path: PathBuf,
+    pub size: u64,
+    pub file_count: usize,
+    pub signature: Option<String>,
+}
+
+/// Hashes a whole folder in one pass: every file's path relative to `root`
+/// plus its full content hash, order-independent.
+pub fn unit_signature(root: &Path, files: &[PathBuf]) -> Option<String> {
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(files.len());
+    for f in files {
+        let rel = f.strip_prefix(root).ok()?.to_string_lossy().to_string();
+        entries.push((rel, full_hash(f).ok()?));
+    }
+    entries.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{:?}", entries).as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 fn link(
     start: PathBuf,
     roots: &HashSet<PathBuf>,
@@ -80,6 +104,9 @@ fn mark_covered(start: PathBuf, covered: &mut HashSet<PathBuf>, dir_subdirs: &Ha
 ///   large enough (i.e. never had another same-sized sibling anywhere in the
 ///   scan) to be picked up by the global per-file duplicate pass.
 ///
+/// Folders the scan kept as single units (`unit_folders`) already carry a
+/// whole-tree signature and act as leaves of this analysis.
+///
 /// Nested duplicates are collapsed: if two directories match, matching
 /// subdirectories under them aren't reported separately, since that's
 /// already implied by the parent match.
@@ -92,6 +119,7 @@ pub fn find_duplicate_folders(
     show_progress: bool,
     file_sizes: &HashMap<PathBuf, u64>,
     folder_hash_threshold: u64,
+    unit_folders: &[UnitFolder],
 ) -> Vec<FolderGroup> {
     let mut content_id: HashMap<&Path, (&str, bool, u64)> = HashMap::new();
     for g in groups {
@@ -112,6 +140,14 @@ pub fn find_duplicate_folders(
         }
     }
 
+    // Unit folders have no per-file entries above; register them as leaf
+    // directories so their parents (and the covered-marking below) see them.
+    let mut units: HashMap<&Path, &UnitFolder> = HashMap::new();
+    for u in unit_folders {
+        units.insert(u.path.as_path(), u);
+        link(u.path.clone(), &roots, &mut known_dirs, &mut dir_subdirs);
+    }
+
     // Deepest directories first, so a directory's subdirectories are always
     // already resolved (size/signature computed, or disqualified) by the
     // time the directory itself is processed.
@@ -127,6 +163,11 @@ pub fn find_duplicate_folders(
     let mut size_by_dir: HashMap<PathBuf, u64> = HashMap::new();
     let mut count_by_dir: HashMap<PathBuf, usize> = HashMap::new();
     for d in &ordered {
+        if let Some(u) = units.get(d.as_path()) {
+            size_by_dir.insert(d.clone(), u.size);
+            count_by_dir.insert(d.clone(), u.file_count);
+            continue;
+        }
         let mut total_size: u64 = 0;
         let mut total_count: usize = 0;
         if let Some(files) = dir_files.get(d) {
@@ -152,6 +193,18 @@ pub fn find_duplicate_folders(
 
     for d in &ordered {
         progress.update(1);
+        if let Some(u) = units.get(d.as_path()) {
+            match &u.signature {
+                Some(sig) => {
+                    signature.insert(d.clone(), Some(sig.clone()));
+                    confirmed_by_dir.insert(d.clone(), true);
+                }
+                None => {
+                    signature.insert(d.clone(), None);
+                }
+            }
+            continue;
+        }
         if count_by_dir[d] == 0 {
             signature.insert(d.clone(), None);
             continue;

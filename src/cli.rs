@@ -40,10 +40,9 @@ struct Cli {
     #[arg(long, default_value_t = dedupe::LARGE_FILE_THRESHOLD, value_name = "BYTES")]
     large_threshold: u64,
 
-    /// Folders below this size are hashed as a single unit (their whole recursive contents
-    /// read and hashed in one pass) to find duplicate folders, instead of relying on the
-    /// slower, more granular per-file duplicate index. Folders at or above this size keep
-    /// using the per-file index instead of being re-read whole.
+    /// Subfolders below this size are not traversed file by file: each is kept as a single
+    /// entry, hashed as a whole to find duplicate folders, and deleted/moved as one item.
+    /// Folders at or above this size are descended into. 0 disables this behavior.
     #[arg(long, default_value_t = dedupe::FOLDER_HASH_THRESHOLD, value_name = "BYTES")]
     folder_hash_threshold: u64,
 

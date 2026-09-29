@@ -123,8 +123,8 @@ fn options_form(app: &App) -> Element<'_, Message> {
         labeled_input("Minimum size", "MB (0 = no minimum)", &app.min_size_mb, Message::MinSizeChanged),
         labeled_input("Large-file threshold", "MB (defer full hash above this)", &app.large_threshold_mb, Message::LargeThresholdChanged),
         labeled_input(
-            "Folder-hash threshold",
-            "MB (hash whole folder at once below this)",
+            "Folder-unit threshold",
+            "MB (keep folders below this as one entry)",
             &app.folder_hash_threshold_mb,
             Message::FolderHashThresholdChanged,
         ),
