@@ -655,14 +655,16 @@ fn delete_manifests_for_runs(conn: &Connection, run_ids: &[String]) -> Result<()
 
 // -- scan manifests -----------------------------------------------------
 
-fn dir_key_for(directories: &[String]) -> String {
+/// Reuse key: the directory set plus the folder-unit threshold, since that
+/// changes which results a scan produces even when no file has changed.
+fn dir_key_for(directories: &[String], unit_threshold: u64) -> String {
     let mut sorted: Vec<String> = directories.to_vec();
     sorted.sort();
-    serde_json::to_string(&sorted).unwrap_or_default()
+    format!("{}|unit={}", serde_json::to_string(&sorted).unwrap_or_default(), unit_threshold)
 }
 
-pub fn save_scan_manifest(directories: &[String], run_id: &str, manifest: &HashMap<String, (u64, f64)>) -> Result<()> {
-    let dir_key = dir_key_for(directories);
+pub fn save_scan_manifest(directories: &[String], unit_threshold: u64, run_id: &str, manifest: &HashMap<String, (u64, f64)>) -> Result<()> {
+    let dir_key = dir_key_for(directories, unit_threshold);
     let mut conn = connect()?;
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM scan_manifest_files WHERE dir_key = ?1", params![dir_key])?;
@@ -681,8 +683,8 @@ pub fn save_scan_manifest(directories: &[String], run_id: &str, manifest: &HashM
     Ok(())
 }
 
-pub fn find_reusable_run(directories: &[String], manifest: &HashMap<String, (u64, f64)>) -> Result<Option<String>> {
-    let dir_key = dir_key_for(directories);
+pub fn find_reusable_run(directories: &[String], unit_threshold: u64, manifest: &HashMap<String, (u64, f64)>) -> Result<Option<String>> {
+    let dir_key = dir_key_for(directories, unit_threshold);
     let conn = connect()?;
     let run_id: Option<String> = conn
         .query_row("SELECT run_id FROM scan_manifests WHERE dir_key = ?1", params![dir_key], |r| r.get(0))

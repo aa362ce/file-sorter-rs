@@ -201,15 +201,15 @@ fn print_scan_results(groups: &[DuplicateGroup], folder_groups: &[FolderGroup], 
             }
         }
         println!(
-            "\n{} duplicate folder(s) found -- their files are also listed individually below. \
-             --delete removes a confirmed one as a single unit; an unverified (large-file) one is \
-             handled file by file instead.",
+            "\n{} duplicate folder(s) found. --delete/--move-to act on a confirmed one as a single \
+             unit; an unverified (large-file) one is handled file by file instead. Files inside \
+             folders below --folder-hash-threshold are not listed individually.",
             folder_groups.len()
         );
     }
 
     if groups.is_empty() {
-        println!("{}", if !cancelled { "No duplicates found." } else { "Scan cancelled before any duplicates were confirmed." });
+        println!("{}", if !cancelled && !folder_groups.is_empty() { "No duplicate files found outside the folders above." } else if !cancelled { "No duplicates found." } else { "Scan cancelled before any duplicates were confirmed." });
     } else {
         let mut total_wasted: u64 = 0;
         let mut deferred_count = 0;

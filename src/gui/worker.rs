@@ -262,3 +262,72 @@ fn tally(report: &mut ActionReport, item: &ActionItem) {
 pub async fn pick_folder(title: &str) -> Option<PathBuf> {
     rfd::AsyncFileDialog::new().set_title(title).pick_folder().await.map(|h| h.path().to_path_buf())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn wait_scan(h: &ScanHandle) -> ScanSummary {
+        while !h.is_done() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        h.take().unwrap().unwrap()
+    }
+
+    /// Large-tree check of what the GUI's Scan / Move buttons do. Point
+    /// `FS_MOCK_DIR` at a tree of duplicated folders and `FS_MOCK_DEST` at a
+    /// destination on the same filesystem; run with `--ignored --nocapture`.
+    /// Set `FS_MOCK_EXPECT` to the expected number of folder groups.
+    #[test]
+    #[ignore]
+    fn large_tree_scan_cancel_resume_move() {
+        let dir = PathBuf::from(std::env::var("FS_MOCK_DIR").expect("FS_MOCK_DIR"));
+        let dest = PathBuf::from(std::env::var("FS_MOCK_DEST").expect("FS_MOCK_DEST"));
+        let expect: usize = std::env::var("FS_MOCK_EXPECT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let opts = || ScanOptions { show_progress: false, ..Default::default() };
+
+        // Cancel shortly after starting, then resume the stopped run.
+        let h = start_scan(vec![dir.clone()], opts(), 0, None);
+        std::thread::sleep(Duration::from_millis(std::env::var("FS_MOCK_CANCEL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1500)));
+        h.request_cancel();
+        let s = wait_scan(&h);
+        println!("cancelled={} resumable={} folder_groups={}", s.cancelled, s.resumable, s.folder_groups.len());
+        let s = if s.resumable {
+            let t = std::time::Instant::now();
+            let s = wait_scan(&start_scan(vec![], opts(), 0, Some(s.run_id.clone())));
+            println!("resume took {:.1}s", t.elapsed().as_secs_f64());
+            s
+        } else {
+            s
+        };
+        println!("final: cancelled={} folder_groups={} file_groups={}", s.cancelled, s.folder_groups.len(), s.groups.len());
+        assert!(!s.cancelled);
+        assert_eq!(s.folder_groups.len(), expect);
+
+        // Default GUI selection: every confirmed folder copy except the first.
+        let items: Vec<ActionItem> = s
+            .folder_groups
+            .iter()
+            .filter(|g| g.confirmed)
+            .flat_map(|g| g.paths[1..].iter())
+            .map(|p| ActionItem { path: p.clone(), is_folder: true, needs_verify: false, reference: PathBuf::new() })
+            .collect();
+        let dry = start_action(items.clone(), ActionKind::MoveTo(dest.clone()), true);
+        while !dry.is_done() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let r = dry.take().unwrap();
+        println!("dry run: folders={} files={} failures={}", r.moved_folders, r.moved_files, r.failures.len());
+        assert_eq!((r.moved_folders, r.moved_files, r.failures.len()), (expect, 0, 0));
+
+        let t = std::time::Instant::now();
+        let real = start_action(items, ActionKind::MoveTo(dest), false);
+        while !real.is_done() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let r = real.take().unwrap();
+        println!("real move: folders={} files={} failures={} in {:.2}s", r.moved_folders, r.moved_files, r.failures.len(), t.elapsed().as_secs_f64());
+        assert_eq!((r.moved_folders, r.moved_files, r.failures.len()), (expect, 0, 0));
+    }
+}

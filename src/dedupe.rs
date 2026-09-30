@@ -945,6 +945,29 @@ pub fn find_duplicates(
         progress.close();
     }
 
+    // Hash the single-entry folders as whole units. Done before the resume
+    // state is built so a cancel here is checkpointed like one at the end of
+    // stage 3 (all file work is kept; only this pass is redone on resume).
+    let mut units: Vec<UnitFolder> = Vec::new();
+    if !cancelled {
+        let unit_progress = Progress::new("Hashing folders", Some(unit_folders.len() as u64), opts.show_progress);
+        units = pool.install(|| {
+            unit_folders
+                .par_iter()
+                .map(|(path, size, files)| {
+                    let signature = if cancel.load(Ordering::Relaxed) { None } else { unit_signature(path, files) };
+                    unit_progress.update(1);
+                    UnitFolder { path: path.clone(), size: *size, file_count: files.len(), signature }
+                })
+                .collect()
+        });
+        unit_progress.close();
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            cancelled_stage = Some("full_hash");
+        }
+    }
+
     // Every path in by_full first passed through by_partial keyed by (size,
     // partial_hash) -- reuse that already-known size instead of a fresh stat.
     let mut size_by_path: HashMap<PathBuf, u64> = HashMap::new();
@@ -1011,17 +1034,6 @@ pub fn find_duplicates(
                 file_sizes.insert(p.clone(), *size);
             }
         }
-        let unit_progress = Progress::new("Hashing folders", Some(unit_folders.len() as u64), opts.show_progress);
-        let units: Vec<UnitFolder> = pool.install(|| {
-            unit_folders
-                .par_iter()
-                .map(|(path, size, files)| {
-                    unit_progress.update(1);
-                    UnitFolder { path: path.clone(), size: *size, file_count: files.len(), signature: unit_signature(path, files) }
-                })
-                .collect()
-        });
-        unit_progress.close();
         folder_groups = find_duplicate_folders(
             &all_files,
             &skipped,
@@ -1139,7 +1151,7 @@ pub fn scan_or_reuse(
             return Ok(ScanResult { groups: vec![], skipped: vec![], cancelled: true, resume_state: None, folder_groups: vec![], reused_run_id: None });
         }
         let dirs_str: Vec<String> = directories.iter().map(|d| d.to_string_lossy().to_string()).collect();
-        if let Some(reused_run_id) = store::find_reusable_run(&dirs_str, manifest.as_ref().unwrap())? {
+        if let Some(reused_run_id) = store::find_reusable_run(&dirs_str, opts.folder_hash_threshold, manifest.as_ref().unwrap())? {
             if let Some((groups, folder_groups)) = store::load_run_groups(&reused_run_id)? {
                 return Ok(ScanResult {
                     groups,
@@ -1157,7 +1169,7 @@ pub fn scan_or_reuse(
     if let Some(m) = &manifest {
         if !result.cancelled {
             let dirs_str: Vec<String> = directories.iter().map(|d| d.to_string_lossy().to_string()).collect();
-            store::save_scan_manifest(&dirs_str, run_id, m)?;
+            store::save_scan_manifest(&dirs_str, opts.folder_hash_threshold, run_id, m)?;
         }
     }
     Ok(result)
@@ -1184,7 +1196,7 @@ mod tests {
         write(&tmp, "c/x.txt", b"different");
 
         let opts = ScanOptions { show_progress: false, folder_hash_threshold: 1024, ..Default::default() };
-        let result = find_duplicates(&[tmp.clone()], &opts, &AtomicBool::new(false), None, "test-units").unwrap();
+        let result = find_duplicates(std::slice::from_ref(&tmp), &opts, &AtomicBool::new(false), None, "test-units").unwrap();
         // Files inside unit folders are never reported individually.
         assert!(result.groups.is_empty());
         assert_eq!(result.folder_groups.len(), 1);
@@ -1195,7 +1207,7 @@ mod tests {
 
         // Threshold 0 disables units: files are traversed individually.
         let opts = ScanOptions { show_progress: false, folder_hash_threshold: 0, ..Default::default() };
-        let result = find_duplicates(&[tmp.clone()], &opts, &AtomicBool::new(false), None, "test-units2").unwrap();
+        let result = find_duplicates(std::slice::from_ref(&tmp), &opts, &AtomicBool::new(false), None, "test-units2").unwrap();
         assert_eq!(result.groups.len(), 2);
         let _ = std::fs::remove_dir_all(&tmp);
     }
